@@ -1,0 +1,26 @@
+[package]
+name = "fish"
+version = "0.0.1"
+authors = ["nkconnor <fish@nconnor.com>"]
+edition = "2018"
+license = "MIT OR Apache-2.0"
+description = "An imperative webhook/callback client API based on async/await"
+repository = "https://github.com/nkconnor/fish"
+documentation = "https://docs.rs/fish"
+readme = "README.md"
+
+[dependencies]
+uuid = { version = "0.8.1", features = ["v4"] }
+async-channel = "1.5"
+url = "2"
+tokio = "0.2"
+hyper = "0.13"
+thiserror = "1"
+futures = "0.3"
+
+[dev_dependencies]
+warp = "0.2"
+reqwest = { version="0.10", features=["json"]}
+serde = { version ="1", features=["derive"] }
+serde_json = "1"
+tokio = {version="0.2", features=["macros"]}
