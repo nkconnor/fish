@@ -18,7 +18,7 @@
 //!
 //! In `Fish`, this interaction looks something like:
 //!
-//! ```rust, ignore
+//! ```rust,ignore
 //! // Step 1: Register webhook for new delivery regions
 //! let orders = server.spawn();
 //!
@@ -60,6 +60,8 @@
 //!
 //! What about you? Have you found this to be challenging? Any suggestions?
 //!
+//!
+//! Feedback, contributions, and bug reports welcome.
 use futures::Stream;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -113,7 +115,7 @@ impl Registry {
 
             use tokio::stream::StreamExt;
             tokio::task::spawn(async move {
-                for id in handle_drop.next().await {
+                while let Some(id) = handle_drop.next().await {
                     requests.lock().unwrap().remove(&id);
                 }
             });
@@ -134,7 +136,12 @@ impl Registry {
         let mut g = self.requests.lock().unwrap();
         if let Some((waker, sender)) = g.remove(&uid) {
             // Dispatch the request to the async Webhook
-            sender.try_send(t).unwrap();
+            // Can we be certain that the opposite side is not closed?
+            sender.try_send(t).expect(
+                "Webhook couldn't have been
+                droped, because, otherwise, requests would have been locked 
+                and the uid removed!",
+            );
 
             // We put the request on the channel, time to wake up the pending Webhook: Future
             waker.lock().unwrap().as_ref().map(|waker| {
@@ -144,7 +151,15 @@ impl Registry {
     }
 }
 
-impl Drop for Webhook {
+struct WebhookInner {
+    url: Url,
+    uid: Uuid,
+    value: Receiver<Request<Body>>,
+    dropper: Sender<Uuid>,
+    waker: Arc<Mutex<Option<Waker>>>,
+}
+
+impl Drop for WebhookInner {
     fn drop(&mut self) {
         self.dropper
             .try_send(self.uid.clone())
@@ -154,17 +169,13 @@ impl Drop for Webhook {
 }
 
 pub struct Webhook {
-    url: Url,
-    uid: Uuid,
-    value: Option<Receiver<Request<Body>>>,
-    dropper: Sender<Uuid>,
-    waker: Arc<Mutex<Option<Waker>>>,
+    inner: WebhookInner,
 }
 
 impl Webhook {
     /// Return
     pub fn url(&self) -> &Url {
-        &self.url
+        &self.inner.url
     }
 }
 
@@ -176,19 +187,15 @@ impl Stream for Webhook {
 
         // Set the waker. This will wake whenever a matching ID
         // is sent to the associated Server
-        *this.waker.lock().unwrap() = Some(_cx.waker().clone());
-        if let Some(receiver) = this.value.take() {
-            match receiver.try_recv() {
-                // ..
-                Ok(l) => Poll::Ready(Some(l)),
-                // Nothing yet!
-                Err(TryRecvError::Empty) => Poll::Pending,
-                // TODO this needs to return Poll::Ready(Err(..))
-                // It would happen if, for example, the Server was Dropped
-                Err(_) => Poll::Pending,
-            }
-        } else {
-            panic!("Internal state inconsistent");
+        *this.inner.waker.lock().unwrap() = Some(_cx.waker().clone());
+
+        match this.inner.value.try_recv() {
+            // ..
+            Ok(l) => Poll::Ready(Some(l)),
+            // Nothing yet!
+            Err(TryRecvError::Empty) => Poll::Pending,
+            // If the server drops
+            Err(TryRecvError::Closed) => Poll::Ready(None),
         }
     }
 }
@@ -197,15 +204,19 @@ impl Stream for Webhook {
 /// over HTTP-Webhooks
 #[derive(Clone)]
 pub struct Server {
+    inner: Arc<Inner>,
+}
+
+// This is so that cloned servers don't trigger the drop condition. Is it a common pattern?
+struct Inner {
     endpoint: url::Url,
-    addr: SocketAddr,
     registry: Registry,
     stop: Sender<()>,
 }
 
-impl Drop for Server {
+impl Drop for Inner {
     fn drop(&mut self) {
-        self.stop.try_send(()).unwrap();
+        self.stop.try_send(()).ok();
     }
 }
 
@@ -225,9 +236,20 @@ impl Server {
     ///
     /// // don't forget to spin up the server!
     /// server.await
-    pub fn new<A: Into<SocketAddr>>(addr: A) -> Self {
+    pub fn start<A: Into<SocketAddr>>(addr: A) -> Self {
         let addr = addr.into();
         let endpoint = Url::parse(format!("http://{}", addr).as_str()).unwrap();
+        Self::with_endpoint(addr, endpoint)
+    }
+
+    /// Create a callback server but with a proxy URL that will forward traffic
+    /// there. E.g. you could use `ngrok` to tunnel a public Url to your
+    /// development server's `fish::Server`
+    pub fn start_with_proxy<A: Into<SocketAddr>>(addr: A, proxy: Url) -> Self {
+        Self::with_endpoint(addr.into(), proxy)
+    }
+
+    fn with_endpoint(addr: SocketAddr, endpoint: Url) -> Self {
         let registry = Registry::new();
 
         type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -273,7 +295,7 @@ impl Server {
             }
         });
 
-        let (stop, on_stop) = async_channel::bounded::<()>(1);
+        let (stop, on_stop) = async_channel::bounded::<()>(16);
 
         // Then bind and serve...
         let server = hyper::Server::bind(&addr)
@@ -283,19 +305,15 @@ impl Server {
             });
 
         // Lost to sea
-        tokio::spawn(server);
+        tokio::spawn(async { server.await });
 
         Server {
-            addr,
-            registry: keep_registry,
-            stop,
-            endpoint,
+            inner: Arc::new(Inner {
+                registry: keep_registry,
+                stop,
+                endpoint,
+            }),
         }
-    }
-
-    /// Override the public URL. Useful e.g. if you are using a proxy.
-    pub fn set_endpoint(&mut self, url: Url) {
-        self.endpoint = url;
     }
 
     /// Spawn a webhook
@@ -313,22 +331,24 @@ impl Server {
         let uid = Uuid::new_v4();
 
         let url = {
-            let mut url = self.endpoint.clone();
+            let mut url = self.inner.endpoint.clone();
             url.query_pairs_mut()
                 .append_pair(QUERY_PARAM_NAME, uid.to_string().as_str());
             url
         };
 
-        let (waker, value) = self.registry.register(uid.clone());
+        let (waker, value) = self.inner.registry.register(uid.clone());
 
-        let dropper = self.registry.drop.clone();
+        let dropper = self.inner.registry.drop.clone();
 
         Webhook {
-            url,
-            uid,
-            value: Some(value),
-            dropper,
-            waker,
+            inner: WebhookInner {
+                url,
+                uid,
+                value,
+                dropper,
+                waker,
+            },
         }
     }
 }
@@ -395,7 +415,7 @@ mod tests {
 
         eprintln!("Starting callback server");
         // Launch fish server on 3031
-        let server: Server = Server::new(([127, 0, 0, 1], 3031));
+        let server: Server = Server::start(([127, 0, 0, 1], 3031));
 
         // Run the tests! woot
         eprintln!("Sending API request");

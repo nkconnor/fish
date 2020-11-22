@@ -1,4 +1,4 @@
-# fish
+# Fish
 
 Using an event based interaction pattern for callback communication is often praised as ideal, but,
 for many cases we've found this results in complexity, bugs, and unnecessary work. `Fish`
@@ -20,7 +20,7 @@ entire lifecycle.
 
 In `Fish`, this interaction looks something like:
 
-```rust, ignore
+```rust
 // Step 1: Register webhook for new delivery regions
 let orders = server.spawn();
 
@@ -54,25 +54,21 @@ while let Ok(order) = orders.next().await {
      // granted.next() and so on!
    }
 }
-```rust
-
-let hook = server.spawn();
-reqwest::post(hook.url()).json(url).await;
-//if you accidentally hook.await before you send the request..
-hook.timeout(Duration::from_secs(30)).await;
-hook.await;
-
-let webhook = server.spawn(|url| {
-    async{
-        reqwest::post("yada").await;
-    }
-}).await?;
+```
 
 Ok, we could've drawn this out a lot further. And sorely missing is the domain-specific logic,
 state updates, caching, and so on that happens during this orchestration. We've found doing
 this in an event-handler-based manner takes an enormous effort.
 
-What about you? Have you found this to be challenging?
-
+What about you? Have you found this to be challenging? Any suggestions?
 
 License: MIT OR Apache-2.0
+
+To think about:
+
+How does this pattern mesh well with CI/CD, hardware faults, and so on? For example,
+let's say there are 10 callbacks outstanding. If the server is restarted, the receivers
+for that will cease. In an "event-based" system, the server would boot back up and
+everything would be hunky-dory, the 3rd party might see a 504 while down and do a retry.
+
+There is unrecoverable state.
