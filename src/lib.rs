@@ -113,7 +113,7 @@ impl Registry {
         {
             let requests = requests.clone();
 
-            use tokio::stream::StreamExt;
+            use futures::stream::StreamExt;
             tokio::task::spawn(async move {
                 while let Some(id) = handle_drop.next().await {
                     requests.lock().unwrap().remove(&id);
@@ -298,7 +298,7 @@ impl Server {
         let (stop, on_stop) = async_channel::bounded::<()>(16);
 
         // Then bind and serve...
-        let server = hyper::Server::bind(&addr)
+        let server = hyper::server::Server::bind(&addr)
             .serve(make_service)
             .with_graceful_shutdown(async move {
                 on_stop.recv().await.ok();
